@@ -64,6 +64,30 @@ class AttnBlock(nn.Module):
         return x + self.proj(out)
 
 
+class CrossAttnBlock(nn.Module):
+    """Image queries attend to caption token embeddings (keys/values)."""
+
+    def __init__(self, ch: int, ctx_dim: int, head_dim: int = 64):
+        super().__init__()
+        self.num_heads = max(1, ch // head_dim)
+        self.norm = nn.GroupNorm(32, ch)
+        self.q = nn.Conv2d(ch, ch, 1)
+        self.kv = nn.Linear(ctx_dim, ch * 2)
+        self.proj = zero_init(nn.Conv2d(ch, ch, 1))
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor, ctx_mask: torch.Tensor | None) -> torch.Tensor:
+        b, c, hgt, wid = x.shape
+        hd = c // self.num_heads
+        q = self.q(self.norm(x)).reshape(b, self.num_heads, hd, hgt * wid).transpose(-1, -2)
+        k, v = self.kv(ctx.to(x.dtype)).chunk(2, dim=-1)
+        k = k.reshape(b, -1, self.num_heads, hd).transpose(1, 2)
+        v = v.reshape(b, -1, self.num_heads, hd).transpose(1, 2)
+        attn_mask = ctx_mask[:, None, None, :] if ctx_mask is not None else None
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(-1, -2).reshape(b, c, hgt, wid)
+        return x + self.proj(out)
+
+
 class Downsample(nn.Module):
     def __init__(self, ch: int):
         super().__init__()
@@ -93,9 +117,11 @@ class UNet(nn.Module):
         attn_res: tuple[int, ...] = (16, 8),
         dropout: float = 0.1,
         num_classes: int | None = None,
+        ctx_dim: int | None = None,
     ):
         super().__init__()
         self.num_classes = num_classes
+        self.ctx_dim = ctx_dim
         emb_dim = base * 4
         self.time_mlp = nn.Sequential(
             nn.Linear(base, emb_dim), nn.SiLU(), nn.Linear(emb_dim, emb_dim)
@@ -116,6 +142,8 @@ class UNet(nn.Module):
                 ch = base * mult
                 if res in attn_res:
                     block.append(AttnBlock(ch))
+                    if ctx_dim is not None:
+                        block.append(CrossAttnBlock(ch, ctx_dim))
                 self.down.append(block)
                 chans.append(ch)
             if level < len(ch_mult) - 1:
@@ -123,9 +151,11 @@ class UNet(nn.Module):
                 chans.append(ch)
                 res //= 2
 
-        self.mid = nn.ModuleList(
-            [ResBlock(ch, ch, emb_dim, dropout), AttnBlock(ch), ResBlock(ch, ch, emb_dim, dropout)]
-        )
+        mid = [ResBlock(ch, ch, emb_dim, dropout), AttnBlock(ch)]
+        if ctx_dim is not None:
+            mid.append(CrossAttnBlock(ch, ctx_dim))
+        mid.append(ResBlock(ch, ch, emb_dim, dropout))
+        self.mid = nn.ModuleList(mid)
 
         self.up = nn.ModuleList()
         for level, mult in reversed(list(enumerate(ch_mult))):
@@ -134,6 +164,8 @@ class UNet(nn.Module):
                 ch = base * mult
                 if res in attn_res:
                     block.append(AttnBlock(ch))
+                    if ctx_dim is not None:
+                        block.append(CrossAttnBlock(ch, ctx_dim))
                 if level > 0 and i == num_res:
                     block.append(Upsample(ch))
                     res *= 2
@@ -143,27 +175,41 @@ class UNet(nn.Module):
         self.conv_out = zero_init(nn.Conv2d(ch, in_ch, 3, padding=1))
 
     def forward(
-        self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor | None = None,
+        ctx: torch.Tensor | None = None,
+        ctx_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         emb = self.time_mlp(timestep_embedding(t, self.base))
         if self.num_classes is not None:
             if y is None:
                 y = torch.full((x.shape[0],), self.num_classes, device=x.device, dtype=torch.long)
             emb = emb + self.class_emb(y)
+        if self.ctx_dim is not None and ctx is None:
+            raise ValueError("model is text-conditioned: ctx is required")
+
+        def apply(layer: nn.Module, h: torch.Tensor) -> torch.Tensor:
+            if isinstance(layer, ResBlock):
+                return layer(h, emb)
+            if isinstance(layer, CrossAttnBlock):
+                return layer(h, ctx, ctx_mask)
+            return layer(h)
 
         h = self.conv_in(x)
         skips = [h]
         for block in self.down:
             for layer in block:
-                h = layer(h, emb) if isinstance(layer, ResBlock) else layer(h)
+                h = apply(layer, h)
             skips.append(h)
 
         for layer in self.mid:
-            h = layer(h, emb) if isinstance(layer, ResBlock) else layer(h)
+            h = apply(layer, h)
 
         for block in self.up:
             h = torch.cat([h, skips.pop()], dim=1)
             for layer in block:
-                h = layer(h, emb) if isinstance(layer, ResBlock) else layer(h)
+                h = apply(layer, h)
 
         return self.conv_out(F.silu(self.norm_out(h)))

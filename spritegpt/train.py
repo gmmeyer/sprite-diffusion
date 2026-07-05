@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--attn-res", default="16,8")
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--class-cond", action="store_true")
+    ap.add_argument("--text-data", default=None, help="sidecar npz with CLIP caption embeddings")
     ap.add_argument("--cond-drop", type=float, default=0.1)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--steps", type=int, default=60000)
@@ -80,7 +81,9 @@ def main() -> None:
     run_dir = Path("runs") / args.run_name
     (run_dir / "samples").mkdir(parents=True, exist_ok=True)
 
-    ds = GpuImageDataset(args.data, device=device, hflip=not args.no_hflip)
+    ds = GpuImageDataset(args.data, device=device, hflip=not args.no_hflip,
+                         text_npz=args.text_data)
+    text_cond = args.text_data is not None
     num_classes = ds.num_classes if args.class_cond else None
     model = UNet(
         img_size=args.img_size,
@@ -90,6 +93,7 @@ def main() -> None:
         attn_res=tuple(int(r) for r in args.attn_res.split(",")),
         dropout=args.dropout,
         num_classes=num_classes,
+        ctx_dim=512 if text_cond else None,
     ).to(device, memory_format=torch.channels_last)
     ema_model = copy.deepcopy(model)
     n_params = sum(p.numel() for p in model.parameters())
@@ -108,6 +112,25 @@ def main() -> None:
         start_step = ck["step"]
         print(f"resumed from {args.resume} at step {start_step}", flush=True)
 
+    preview_ctx = preview_mask = None
+    if text_cond:
+        from spritegpt.text import embed_prompts
+
+        prompts = [
+            "a blue ghost sprite",
+            "grinning face with sweat emoji",
+            "red dragon monster, pixel art sprite",
+            "golden sword item, pixel art sprite",
+            "smiling face with sunglasses emoji",
+            "green potion item, pixel art sprite",
+            "dungeon wall tile, pixel art",
+            "cat face emoji",
+        ]
+        (run_dir / "preview_prompts.txt").write_text("\n".join(prompts))
+        preview_ctx, preview_mask = embed_prompts(prompts, device)
+        preview_ctx = preview_ctx.repeat_interleave(8, dim=0)  # 8 prompts x 8 seeds
+        preview_mask = preview_mask.repeat_interleave(8, dim=0)
+
     log_path = run_dir / "log.csv"
     if not log_path.exists():
         log_path.write_text("step,loss,lr,imgs_per_sec\n")
@@ -118,16 +141,23 @@ def main() -> None:
         for g in opt.param_groups:
             g["lr"] = lr
 
-        x, y = ds.batch(args.batch_size)
-        x = x.contiguous(memory_format=torch.channels_last)
-        if num_classes is not None:
-            drop = torch.rand(y.shape[0], device=device) < args.cond_drop
-            y = torch.where(drop, torch.full_like(y, num_classes), y)
+        y = ctx = ctx_mask = None
+        if text_cond:
+            x, ctx, ctx_mask = ds.batch_text(args.batch_size)
+            drop = torch.rand(x.shape[0], device=device) < args.cond_drop
+            ctx = torch.where(drop[:, None, None], ds.null_ctx, ctx)
+            ctx_mask = torch.where(drop[:, None], ds.null_mask, ctx_mask)
         else:
-            y = None
+            x, y = ds.batch(args.batch_size)
+            if num_classes is not None:
+                drop = torch.rand(y.shape[0], device=device) < args.cond_drop
+                y = torch.where(drop, torch.full_like(y, num_classes), y)
+            else:
+                y = None
+        x = x.contiguous(memory_format=torch.channels_last)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = rf_loss(model, x, y, time_sampling=args.time_sampling)
+            loss = rf_loss(model, x, y, ctx, ctx_mask, time_sampling=args.time_sampling)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -148,15 +178,18 @@ def main() -> None:
             ema.copy_to(ema_model)
             ema_model.eval()
             gen = torch.Generator(device=device).manual_seed(42)
-            if num_classes is not None:
-                sy = torch.arange(64, device=device) % num_classes
-                gy, gscale = sy, args.guidance
-            else:
-                gy, gscale = None, 0.0
+            gy, gctx, gmask, nctx, nmask, gscale = None, None, None, None, None, 0.0
+            if text_cond:
+                gctx, gmask = preview_ctx, preview_mask
+                nctx, nmask, gscale = ds.null_ctx, ds.null_mask, args.guidance
+            elif num_classes is not None:
+                gy = torch.arange(64, device=device) % num_classes
+                gscale = args.guidance
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 imgs = sample(ema_model, 64, args.img_size, steps=args.sample_steps,
-                              y=gy, guidance=gscale, num_classes=num_classes,
-                              device=device, generator=gen)
+                              y=gy, ctx=gctx, ctx_mask=gmask, null_ctx=nctx,
+                              null_mask=nmask, guidance=gscale,
+                              num_classes=num_classes, device=device, generator=gen)
             save_image_grid(imgs.float(), run_dir / "samples" / f"step_{step+1:06d}.png", nrow=8)
             t0 = time.perf_counter()  # don't count sampling in imgs/s
 
