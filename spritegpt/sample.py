@@ -29,23 +29,30 @@ def main() -> None:
 
     device = "cuda"
     ck = torch.load(args.ckpt, map_location=device, weights_only=False)
-    ta = ck["args"]
-    num_classes = None
-    if ta.get("class_cond"):
-        # class embedding table size minus the null token
-        num_classes = ck["model"]["class_emb.weight"].shape[0] - 1
-    text_cond = ta.get("text_data") is not None
+    if "config" in ck:  # HF export: EMA weights + config, no optimizer/raw weights
+        cfg, step = ck["config"], ck["config"]["train_steps"]
+        num_classes, ctx_dim = cfg["num_classes"], cfg.get("ctx_dim")
+        state = ck["ema_state_dict"]
+    else:  # training checkpoint
+        ta, cfg, step = ck["args"], ck["args"], ck["step"]
+        num_classes = None
+        if ta.get("class_cond"):
+            # class embedding table size minus the null token
+            num_classes = ck["model"]["class_emb.weight"].shape[0] - 1
+        ctx_dim = 512 if ta.get("text_data") is not None else None
+        state = ck["model"] if args.raw_weights else ck["ema"]["shadow"]
+    text_cond = ctx_dim is not None
     model = UNet(
-        img_size=ta["img_size"],
-        base=ta["base"],
-        ch_mult=tuple(int(c) for c in ta["ch_mult"].split(",")),
-        num_res=ta["num_res"],
-        attn_res=tuple(int(r) for r in ta["attn_res"].split(",")),
+        img_size=cfg["img_size"],
+        base=cfg["base"],
+        ch_mult=tuple(int(c) for c in cfg["ch_mult"].split(",")),
+        num_res=cfg["num_res"],
+        attn_res=tuple(int(r) for r in cfg["attn_res"].split(",")),
         dropout=0.0,
         num_classes=num_classes,
-        ctx_dim=512 if text_cond else None,
+        ctx_dim=ctx_dim,
     ).to(device)
-    model.load_state_dict(ck["model"] if args.raw_weights else ck["ema"]["shadow"])
+    model.load_state_dict(state)
     model.eval()
 
     y, ctx, mask, nctx, nmask, guidance = None, None, None, None, None, 0.0
@@ -67,12 +74,12 @@ def main() -> None:
     if args.seed is not None:
         gen = torch.Generator(device=device).manual_seed(args.seed)
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        imgs = sample(model, args.n, ta["img_size"], steps=args.steps, y=y,
+        imgs = sample(model, args.n, cfg["img_size"], steps=args.steps, y=y,
                       ctx=ctx, ctx_mask=mask, null_ctx=nctx, null_mask=nmask,
                       guidance=guidance, num_classes=num_classes,
                       device=device, generator=gen)
     save_image_grid(imgs.float(), args.out)
-    print(f"saved {args.n} samples (step {ck['step']}) -> {args.out}")
+    print(f"saved {args.n} samples (step {step}) -> {args.out}")
 
 
 if __name__ == "__main__":

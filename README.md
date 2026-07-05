@@ -43,9 +43,22 @@ uv run python -m spritegpt.sample --ckpt runs/m1-uncond32/ckpt_latest.pt --out g
 # class-conditional: --class-id 9 --guidance 3.0  (9 = smileys-emotion)
 ```
 
+## Text-conditioned sampling (milestone 3 model)
+
+```sh
+uv run python scripts/make_captions.py   # captions + cached CLIP embeddings
+uv run python -m spritegpt.train --data data/combined64.npz --text-data data/text64.npz \
+    --run-name m3-text64 --img-size 64 --ch-mult 1,2,2,3 --batch-size 128 --steps 120000
+uv run python -m spritegpt.sample --ckpt runs/m3-text64/ckpt_latest.pt \
+    --prompt "a blue ghost sprite" --guidance 5 --out ghost.png
+```
+
+Trained weights: https://huggingface.co/gmmeyer/sprite-gpt
+
 ## Milestones
 
 1. [x] Unconditional 32px emoji
-2. [ ] Class-conditional 64px (emoji groups; add sprites from OpenGameArt/Kenney)
-3. [ ] CLIP text conditioning via cross-attention (emoji names are free captions)
+2. [x] Class-conditional 64px (13 emoji groups + 18 sprite packs, 31 classes)
+3. [x] CLIP text conditioning via cross-attention (emoji names are free captions;
+       composes unseen attribute combinations like "a purple dragon emoji")
 4. [ ] Stretch: 4-frame walk-cycle sprite sheets

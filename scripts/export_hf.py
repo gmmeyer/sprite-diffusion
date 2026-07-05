@@ -28,6 +28,7 @@ def main() -> None:
         "num_res": ta["num_res"],
         "attn_res": ta["attn_res"],
         "num_classes": num_classes,
+        "ctx_dim": 512 if ta.get("text_data") else None,
         "objective": "rectified_flow",
         "train_steps": ck["step"],
     }
